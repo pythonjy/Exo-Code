@@ -14,9 +14,11 @@ import {
   isMcpCallerAuthEnabled,
   encodeTokenEnvelope,
   type CallerIdentityKey,
+  type CapabilityEnvelope,
+  isEnvelopeReduction,
 } from '@claude-flow/security';
 
-export interface WorkerCapabilityEnvelope {
+export interface WorkerCapabilityEnvelope extends CapabilityEnvelope {
   actions?: string[];
   resources?: string[];
   tools?: string[];
@@ -33,6 +35,10 @@ export interface WorkerConfig {
   role: string;
   prompt: string;
   model?: string;
+  /** Opt-in execution contract; existing text workers retain their flag set. */
+  reasoningEffort?: string;
+  structuredOutput?: boolean;
+  includeMemoryProtocol?: boolean;
   maxTurns?: number;
   timeout?: number;
   dependsOn?: string[];
@@ -68,6 +74,7 @@ export interface DualModeConfig {
   worktreeIsolation?: boolean;
   dependencyFailure?: 'cancel' | 'skip';
   policyPreflight?: boolean;
+  parentCapabilityEnvelope?: WorkerCapabilityEnvelope;
 }
 
 export interface CollaborationResult {
@@ -118,6 +125,7 @@ export class DualModeOrchestrator extends EventEmitter {
       worktreeIsolation: config.worktreeIsolation ?? false,
       dependencyFailure: config.dependencyFailure ?? 'cancel',
       policyPreflight: config.policyPreflight ?? false,
+      parentCapabilityEnvelope: config.parentCapabilityEnvelope ?? {},
     };
   }
 
@@ -193,6 +201,7 @@ export class DualModeOrchestrator extends EventEmitter {
     } catch (error) {
       result.status = 'failed';
       result.error = error instanceof Error ? error.message : String(error);
+      if (error instanceof Error && 'stdout' in error && typeof error.stdout === 'string') result.output = error.stdout;
       result.completedAt = new Date();
       this.emit('worker:failed', { id: config.id, error: result.error });
     }
@@ -206,7 +215,7 @@ export class DualModeOrchestrator extends EventEmitter {
     const command = config.platform === 'claude' ? this.config.claudeCommand : this.config.codexCommand;
 
     // Build the prompt with memory integration
-    const enhancedPrompt = this.buildCollaborativePrompt(config);
+    const enhancedPrompt = config.includeMemoryProtocol === false ? config.prompt : this.buildCollaborativePrompt(config);
 
     // Each platform has its own non-interactive entry point and flag set:
     //   Claude Code:  claude -p <prompt> --output-format text [--max-turns N] [--model M]
@@ -214,7 +223,9 @@ export class DualModeOrchestrator extends EventEmitter {
     // (`codex exec` runs autonomously; PROMPT is a positional arg and must come last.)
     let args: string[];
     if (config.platform === 'claude') {
-      args = ['-p', enhancedPrompt, '--output-format', 'text'];
+      args = ['-p', enhancedPrompt, '--output-format', config.structuredOutput ? 'json' : 'text'];
+      if (config.structuredOutput && config.readOnly) args.push('--tools', 'Read,Grep,Glob', '--disallowedTools', 'mcp__*');
+      if (config.reasoningEffort) args.push('--effort', config.reasoningEffort);
       if (config.maxTurns) {
         args.push('--max-turns', String(config.maxTurns));
       }
@@ -229,6 +240,8 @@ export class DualModeOrchestrator extends EventEmitter {
       if (config.model) {
         args.push('-m', config.model);
       }
+      if (config.structuredOutput) args.push('--json');
+      if (config.reasoningEffort) args.push('-c', `model_reasoning_effort=${JSON.stringify(config.reasoningEffort)}`);
       args.push(enhancedPrompt);
     }
 
@@ -260,24 +273,32 @@ export class DualModeOrchestrator extends EventEmitter {
         if (errorOutput.length < maxOutputBytes) errorOutput += data.toString().slice(0, maxOutputBytes - errorOutput.length);
       });
 
+      let timedOut = false;
+      let forceTimer: ReturnType<typeof setTimeout> | undefined;
       const timer = setTimeout(() => {
+        timedOut = true;
         proc.kill('SIGTERM');
-        reject(new Error(`Worker ${config.id} timed out after ${timeout}ms`));
+        // Keep the execution reservation until the child actually exits.
+        forceTimer = setTimeout(() => proc.kill('SIGKILL'), 1000);
       }, timeout);
 
       proc.on('close', (code) => {
         clearTimeout(timer);
+        if (forceTimer) clearTimeout(forceTimer);
         this.processes.delete(config.id);
 
-        if (code === 0) {
+        if (timedOut) {
+          reject(Object.assign(new Error(`Worker ${config.id} timed out after ${timeout}ms`), { stdout: output }));
+        } else if (code === 0) {
           resolve(output || errorOutput);
         } else {
-          reject(new Error(`Worker ${config.id} exited with code ${code}: ${errorOutput}`));
+          reject(Object.assign(new Error(`Worker ${config.id} exited with code ${code}: ${errorOutput}`), { stdout: output }));
         }
       });
 
       proc.on('error', (err) => {
         clearTimeout(timer);
+        if (forceTimer) clearTimeout(forceTimer);
         this.processes.delete(config.id);
         reject(err);
       });
@@ -566,6 +587,7 @@ Remember: Other agents depend on your results in shared memory. Be concise and s
       destructive: false,
       delegationDepth: 0,
       expiresAt: Date.now() + this.config.timeout,
+      ...this.config.parentCapabilityEnvelope,
     };
   }
 
@@ -574,6 +596,7 @@ Remember: Other agents depend on your results in shared memory. Be concise and s
     const requested = worker.capabilityEnvelope;
     if (!requested) return parent;
     const child = { ...parent, ...requested };
+    if (!isEnvelopeReduction(parent, child)) throw new Error(`worker ${worker.id} capability envelope cannot expand`);
     const matches = (patterns: string[] | undefined, value: string): boolean => (
       !patterns?.length
       || patterns.some((pattern) => pattern === '*' || pattern === value
@@ -669,6 +692,12 @@ Remember: Other agents depend on your results in shared memory. Be concise and s
       this.emit('worker:stopped', { id });
     }
     this.processes.clear();
+  }
+
+  /** Snapshot after spawnWorker; lets other Ruflo execution paths reuse this lifecycle. */
+  getWorkerResult(id: string): WorkerResult | undefined {
+    const worker = this.workers.get(id);
+    return worker ? { ...worker } : undefined;
   }
 }
 

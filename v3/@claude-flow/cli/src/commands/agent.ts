@@ -50,6 +50,7 @@ function updateSwarmActivityMetrics(agentCountDelta: number): void {
 
 // Available agent types with descriptions
 const AGENT_TYPES = [
+  { value: 'planner', label: 'Planner', hint: 'Task planning and control' },
   { value: 'coder', label: 'Coder', hint: 'Code development with neural patterns' },
   { value: 'researcher', label: 'Researcher', hint: 'Research with web access and data analysis' },
   { value: 'tester', label: 'Tester', hint: 'Comprehensive testing with automation' },
@@ -88,9 +89,8 @@ const spawnCommand: Command = {
     {
       name: 'provider',
       short: 'p',
-      description: 'Provider to use (anthropic, openrouter, ollama)',
-      type: 'string',
-      default: 'anthropic'
+      description: 'Provider to use (anthropic, openai, openrouter, ollama)',
+      type: 'string'
     },
     {
       name: 'model',
@@ -103,6 +103,10 @@ const spawnCommand: Command = {
       description: 'Initial task for the agent',
       type: 'string'
     },
+    { name: 'family', description: 'Model family override (requires heterogeneousModels.enabled)', type: 'string' },
+    { name: 'runtime', description: 'Execution runtime: api, claude-code, codex', type: 'string' },
+    { name: 'reasoning-effort', description: 'Runtime-native reasoning effort', type: 'string' },
+    { name: 'work', description: 'Governor assignments/estimates as a JSON object', type: 'string' },
     {
       name: 'timeout',
       description: 'Agent timeout in seconds',
@@ -145,8 +149,12 @@ const spawnCommand: Command = {
     output.printInfo(`Spawning ${agentType} agent: ${output.highlight(agentName)}`);
 
     try {
+      const { getModelFeatures } = await import('../services/model-selection.js');
+      const heterogeneous = getModelFeatures(ctx.cwd).enabled;
       // Call MCP tool to spawn agent
       const result = await callMCPTool<{
+        success?: boolean;
+        error?: string;
         agentId: string;
         agentType: string;
         status: string;
@@ -156,10 +164,17 @@ const spawnCommand: Command = {
         id: agentName,
         config: {
           provider: ctx.flags.provider || 'anthropic',
+          ...(heterogeneous ? { providerExplicit: ctx.flags.provider !== undefined } : {}),
           model: ctx.flags.model,
           task: ctx.flags.task,
           timeout: ctx.flags.timeout,
           autoTools: ctx.flags.autoTools,
+          ...(ctx.flags.work ? { work: JSON.parse(String(ctx.flags.work)) } : {}),
+          ...((ctx.flags.family || ctx.flags.runtime || ctx.flags.reasoningEffort) ? { modelTarget: {
+            ...(ctx.flags.family ? { family: ctx.flags.family } : {}),
+            ...(ctx.flags.runtime ? { runtime: ctx.flags.runtime } : {}),
+            ...(ctx.flags.reasoningEffort ? { reasoningEffort: ctx.flags.reasoningEffort } : {}),
+          } } : {}),
         },
         priority: 'normal',
         metadata: {
@@ -167,6 +182,11 @@ const spawnCommand: Command = {
           capabilities: getAgentCapabilities(agentType),
         },
       });
+
+      if (result.success === false) {
+        output.printError(result.error ?? 'Agent spawn denied');
+        return { success: false, exitCode: 1, data: result };
+      }
 
       output.writeln();
       output.printTable({
@@ -1074,10 +1094,46 @@ function formatLogLevel(level: string): string {
 }
 
 // Main agent command
+const executeCommand: Command = {
+  name: 'execute', description: 'Execute a prompt through a tracked agent provider/runtime',
+  options: [
+    { name: 'id', description: 'Agent ID (or first positional argument)', type: 'string' },
+    { name: 'prompt', description: 'Task to execute', type: 'string', required: true },
+    { name: 'timeout', description: 'Timeout in seconds', type: 'number', default: 300 },
+    { name: 'max-tokens', description: 'Maximum API output tokens', type: 'number', default: 1024 },
+  ],
+  action: async (ctx) => {
+    const agentId = ctx.args[0] || ctx.flags.id;
+    if (!agentId) { output.printError('Agent ID is required'); return { success: false, exitCode: 1 }; }
+    try {
+      const result = await callMCPTool<import('../mcp-tools/agent-execute-core.js').AgentExecuteResult>('agent_execute', {
+        agentId, prompt: ctx.flags.prompt, timeoutMs: Number(ctx.flags.timeout) * 1000, maxTokens: ctx.flags.maxTokens,
+      });
+      if (ctx.flags.format === 'json') output.printJson(result);
+      else { if (result.output) output.writeln(result.output); if (result.error) output.printError(result.error); }
+      return { success: result.success, data: result, ...(result.success ? {} : { exitCode: 1 }) };
+    } catch (error) { output.printError(String(error)); return { success: false, exitCode: 1 }; }
+  },
+};
+const controlCommand: Command = {
+  name: 'control', description: 'Read-only heterogeneous model and Governor control panel', options: [],
+  action: async (ctx) => {
+    const { getControlPanelSnapshot, renderControlPanel } = await import('../services/control-panel.js');
+    try {
+      const snapshot = getControlPanelSnapshot(ctx.cwd);
+      if (ctx.flags.format === 'json') output.printJson(snapshot);
+      else output.writeln(renderControlPanel(snapshot));
+      return { success: true, data: snapshot };
+    } catch (error) {
+      output.printError(error instanceof Error ? error.message : String(error));
+      return { success: false, exitCode: 1 };
+    }
+  },
+};
 export const agentCommand: Command = {
   name: 'agent',
   description: 'Agent management commands',
-  subcommands: [spawnCommand, listCommand, statusCommand, stopCommand, metricsCommand, poolCommand, healthCommand, logsCommand, ...wasmSubcommands, agentPublishCommand],
+  subcommands: [spawnCommand, listCommand, statusCommand, stopCommand, metricsCommand, poolCommand, healthCommand, logsCommand, executeCommand, controlCommand, ...wasmSubcommands, agentPublishCommand],
   options: [],
   examples: [
     { command: 'claude-flow agent spawn -t coder', description: 'Spawn a coder agent' },

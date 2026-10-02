@@ -66,7 +66,9 @@ export const msOf = (value: unknown): number | undefined => {
 }
 
 export type SwarmInfo = { id: string; topology: string; status: string; maxAgents?: number; strategy?: string; agentIds: string[]; updatedAt?: string }
-export type AgentRecord = { id: string; type: string; name?: string; status: string; health?: number; taskCount?: number; createdAtMs?: number }
+export type AgentRecord = { id: string; type: string; name?: string; status: string; health?: number; taskCount?: number; createdAtMs?: number
+  family?: string; provider?: string; model?: string; runtime?: string; selector?: string; spawnReason?: string
+  recommendedAgents?: number; hardLimit?: number; inputTokens?: number; outputTokens?: number; cachedTokens?: number; costUsd?: number; latencyMs?: number; failure?: string }
 export type TaskRecord = { id: string; type: string; description: string; status: string; assignedTo: string[]; createdAtMs?: number }
 export type Claimant = { kind: 'agent' | 'human'; id: string; agentType?: string; name?: string }
 export type ClaimRecord = {
@@ -163,6 +165,35 @@ export function parseAgents(text: string | null): AgentRecord[] {
     if (health !== undefined) record.health = health
     if (taskCount !== undefined) record.taskCount = taskCount
     if (createdAtMs !== undefined) record.createdAtMs = createdAtMs
+
+    const target = recordOf(agent.modelTarget)
+    if (target !== null) {
+      if (typeof agent.executionId === 'string') record.status = agent.status === 'terminated' ? 'terminating' : 'running'
+      for (const key of ['family', 'provider', 'model', 'runtime'] as const) {
+        const value = stringOf(target[key], 100)
+        if (value !== undefined) record[key] = value
+      }
+      const selector = stringOf(target.selectedBy)
+      if (selector !== undefined) record.selector = selector
+      const recommendation = recordOf(agent.recommendation)
+      const reason = stringOf(recommendation?.spawnReason)
+      if (reason !== undefined) record.spawnReason = reason
+      const recommended = numberOf(recommendation?.recommendedAgents)
+      const limit = numberOf(recommendation?.effectiveLimit)
+      if (recommended !== undefined) record.recommendedAgents = recommended
+      if (limit !== undefined) record.hardLimit = limit
+      const result = recordOf(agent.lastResult)
+      const usage = recordOf(result?.metering)
+      for (const key of ['inputTokens', 'outputTokens', 'cachedTokens'] as const) {
+        const value = numberOf(usage?.[key])
+        if (value !== undefined && value >= 0) record[key] = value
+      }
+      const cost = numberOf(result?.costUsd)
+      const latency = numberOf(result?.durationMs)
+      if (cost !== undefined && cost >= 0) record.costUsd = cost
+      if (latency !== undefined && latency >= 0) record.latencyMs = latency
+      if (result?.success === false) record.failure = stringOf(result.error, 160) ?? 'execution failed'
+    }
 
     return [record]
   })

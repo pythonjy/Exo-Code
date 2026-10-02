@@ -78,8 +78,9 @@ type AgentRow = Record<string, unknown>;
  * busy, and completing one never counted it: `hive-mind status` showed the
  * worker idle with 0 completed while its task sat in the queue.
  */
-function updateAgents(agentIds: string[], mutate: (agent: AgentRow) => void): void {
+async function updateAgents(agentIds: string[], mutate: (agent: AgentRow) => void): Promise<void> {
   if (agentIds.length === 0) return;
+  const operation = () => {
   const paths = [
     join(getProjectCwd(), STORAGE_DIR, 'agents', 'store.json'),
     join(getProjectCwd(), STORAGE_DIR, 'agents.json'),
@@ -101,11 +102,16 @@ function updateAgents(agentIds: string[], mutate: (agent: AgentRow) => void): vo
       // Best-effort agent sync: a corrupt agent store must not fail the task op.
     }
   }
+  };
+  const { getGovernorConfig, withAgentRegistryLock } = await import('../services/agent-governor.js');
+  const { getModelFeatures } = await import('../services/model-selection.js');
+  if (getGovernorConfig(getProjectCwd()).enabled || getModelFeatures(getProjectCwd()).enabled) await withAgentRegistryLock(getProjectCwd(), operation);
+  else operation();
 }
 
 /** Return agents still holding `taskId` to idle. */
-function releaseAgents(agentIds: string[], taskId: string): void {
-  updateAgents(agentIds, (agent) => {
+async function releaseAgents(agentIds: string[], taskId: string): Promise<void> {
+  await updateAgents(agentIds, (agent) => {
     if (agent.currentTask === taskId) {
       agent.status = 'idle';
       agent.currentTask = null;
@@ -306,7 +312,7 @@ export const taskTools: MCPTool[] = [
         saveTaskStore(store);
 
         // Sync assigned agents back to idle and increment taskCount
-        updateAgents(task.assignedTo, (agent) => {
+        await updateAgents(task.assignedTo, (agent) => {
           if (agent.currentTask === taskId) {
             agent.status = 'idle';
             agent.currentTask = null;
@@ -364,7 +370,7 @@ export const taskTools: MCPTool[] = [
           // otherwise a worker whose run failed stays `busy` forever.
           if (newStatus === 'failed') {
             task.completedAt = new Date().toISOString();
-            releaseAgents(task.assignedTo, taskId);
+            await releaseAgents(task.assignedTo, taskId);
           }
         }
         if (typeof input.progress === 'number') {
@@ -424,16 +430,30 @@ export const taskTools: MCPTool[] = [
 
       if (input.unassign) {
         // Revert previously assigned agents to idle
-        releaseAgents(previouslyAssigned, taskId);
+        await releaseAgents(previouslyAssigned, taskId);
         task.assignedTo = [];
       } else {
         const agentIds = (input.agentIds as string[]) || [];
         // Revert old agents to idle
-        releaseAgents(previouslyAssigned.filter((id) => !agentIds.includes(id)), taskId);
+        await releaseAgents(previouslyAssigned.filter((id) => !agentIds.includes(id)), taskId);
         // Set new agents to active
-        updateAgents(agentIds, (agent) => {
+        const { getModelFeatures } = await import('../services/model-selection.js');
+        const { getGovernorConfig } = await import('../services/agent-governor.js');
+        const enabled = getModelFeatures(getProjectCwd()).enabled || getGovernorConfig(getProjectCwd()).enabled;
+        const recorded = new Set<unknown>();
+        const { recordExecutionEvent } = await import('../services/execution-telemetry.js');
+        const { normalizeWork } = await import('../services/agent-governor.js');
+        await updateAgents(agentIds, (agent) => {
           agent.status = 'busy';
           agent.currentTask = taskId;
+          if (enabled) {
+            agent.work = { ...normalizeWork(agent.work), taskId };
+            if (previouslyAssigned.length && !previouslyAssigned.includes(String(agent.agentId)) && !recorded.has(agent.agentId)) {
+              recordExecutionEvent(getProjectCwd(), { event: 'handoff', agentId: String(agent.agentId), role: String(agent.agentType),
+                taskId, handoffs: 1, target: agent.modelTarget as import('../services/model-contract.js').ModelTarget | undefined });
+              recorded.add(agent.agentId);
+            }
+          }
         });
         task.assignedTo = agentIds;
         // Auto-transition task to in_progress if pending
@@ -485,7 +505,7 @@ export const taskTools: MCPTool[] = [
         task.completedAt = new Date().toISOString();
         task.result = { cancelReason: input.reason || 'Cancelled by user' };
         saveTaskStore(store);
-        releaseAgents(task.assignedTo, taskId);
+        await releaseAgents(task.assignedTo, taskId);
 
         return {
           success: true,
