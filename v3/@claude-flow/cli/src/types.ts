@@ -11,3 +11,10 @@
  */
 
 export * from '@claude-flow/cli-core/types';
+import type { V3Config as CoreV3Config } from '@claude-flow/cli-core/types';
+/** Package-owned opt-in extensions; the installed legacy cli-core contract stays compatible. */
+export interface V3Config extends CoreV3Config {
+  heterogeneousModels?: Record<string, unknown>;
+  agentGovernor?: Record<string, unknown>;
+  controlPanel?: Record<string, unknown>;
+}

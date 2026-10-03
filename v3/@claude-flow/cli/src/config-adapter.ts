@@ -13,6 +13,7 @@ export function systemConfigToV3Config(systemConfig: SystemConfig): V3Config {
   return {
     version: '3.0.0',
     projectRoot: systemConfig.orchestrator?.session?.dataDir || process.cwd(),
+    ...modelFeatureSections(systemConfig),
 
     // Agent configuration
     agents: {
@@ -73,6 +74,7 @@ export function systemConfigToV3Config(systemConfig: SystemConfig): V3Config {
  */
 export function v3ConfigToSystemConfig(v3Config: V3Config): Partial<SystemConfig> {
   return {
+    ...modelFeatureSections(v3Config),
     orchestrator: {
       lifecycle: {
         maxConcurrentAgents: v3Config.agents.maxConcurrent,
@@ -147,6 +149,12 @@ export function v3ConfigToSystemConfig(v3Config: V3Config): Partial<SystemConfig
       },
     },
   };
+}
+
+function modelFeatureSections(config: object): Pick<V3Config, 'heterogeneousModels' | 'agentGovernor' | 'controlPanel'> {
+  const source = config as Record<string, unknown>;
+  return Object.fromEntries(['heterogeneousModels', 'agentGovernor', 'controlPanel']
+    .filter(key => source[key] !== undefined).map(key => [key, structuredClone(source[key])])) as Pick<V3Config, 'heterogeneousModels' | 'agentGovernor' | 'controlPanel'>;
 }
 
 /**

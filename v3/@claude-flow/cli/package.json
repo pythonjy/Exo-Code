@@ -43,6 +43,18 @@
   "author": "RuvNet <ruv@ruv.io> (https://ruv.io)",
   "license": "MIT",
   "exports": {
+    "./model-selection": {
+      "types": "./dist/src/services/model-selection.d.ts",
+      "import": "./dist/src/services/model-selection.js"
+    },
+    "./model-runtime": {
+      "types": "./dist/src/services/heterogeneous-execution.d.ts",
+      "import": "./dist/src/services/heterogeneous-execution.js"
+    },
+    "./control-panel": {
+      "types": "./dist/src/services/control-panel.d.ts",
+      "import": "./dist/src/services/control-panel.js"
+    },
     ".": {
       "types": "./dist/src/index.d.ts",
       "import": "./dist/src/index.js"

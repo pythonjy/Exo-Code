@@ -5,12 +5,18 @@
  * Includes model routing integration for intelligent model selection.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { type MCPTool, getProjectCwd } from './types.js';
 import { validateIdentifier, validateText, validateAgentSpawn } from './validate-input.js';
-import { executeAgentTask } from './agent-execute-core.js';
+import { executeAgentTask, type AgentRecord as ExecutableAgentRecord } from './agent-execute-core.js';
 import { pheromoneAgentEligibility } from './swarm-tools.js';
+import { ModelTargetSchema } from '../services/model-contract.js';
+import { getModelFeatures, resolveRoleFamily, normalizeLegacyTarget } from '../services/model-selection.js';
+import { activeAgents, configuredAgentLimit, decideAgentSpawn, getGovernorConfig, normalizeWork, readAgentBudgets, withAgentRegistryLock } from '../services/agent-governor.js';
+import { ConfigFileManager } from '../services/config-file-manager.js';
+import { recordExecutionEvent } from '../services/execution-telemetry.js';
+import { getExecutionPolicyContext } from '../services/policy-runtime.js';
 
 // Storage paths
 const STORAGE_DIR = '.claude-flow';
@@ -25,7 +31,7 @@ const HIVE_AGENT_FILE = 'agents.json';
 // Model types matching Claude Agent SDK
 type ClaudeModel = 'haiku' | 'sonnet' | 'opus' | 'opus-4.7' | 'inherit';
 
-interface AgentRecord {
+interface AgentRecord extends ExecutableAgentRecord {
   agentId: string;
   agentType: string;
   status: 'idle' | 'busy' | 'terminated';
@@ -39,7 +45,7 @@ interface AgentRecord {
   /** ADR-149 — concrete picked model id (e.g. inclusionai/ling-2.6-flash). */
   modelId?: string;
   /** ADR-148 — execution provider hint. #2962 widened to include 'ollama'. */
-  provider?: 'anthropic' | 'openrouter' | 'ollama';
+  provider?: string;
   /** ADR-148 — concrete OpenRouter slug when provider='openrouter'. */
   openrouterModel?: string;
   lastResult?: Record<string, unknown>;
@@ -286,6 +292,16 @@ async function determineAgentModel(
 
 export const agentTools: MCPTool[] = [
   {
+    name: 'agent_control_panel', category: 'agent',
+    description: 'Read-only model/runtime, Governor, budget, execution and efficiency snapshot. Requires controlPanel.enabled.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async () => {
+      const { getControlPanelSnapshot } = await import('../services/control-panel.js');
+      try { return { success: true, ...getControlPanelSnapshot(getProjectCwd()) }; }
+      catch (error) { return { success: false, error: error instanceof Error ? error.message : String(error) }; }
+    },
+  },
+  {
     name: 'agent_spawn',
     description: 'Spawn a Ruflo-tracked agent with cost attribution + memory persistence + swarm coordination. Use when native Task tool is wrong because you need (a) cost tracking per agent in the cost-tracking namespace, (b) cross-session learning via the patterns namespace, or (c) coordination with other agents in a swarm topology (hierarchical / mesh / consensus). For one-shot subtasks with no learning loop, native Task is fine. Pair with hooks_route to pick the right model first.',
     category: 'agent',
@@ -294,6 +310,7 @@ export const agentTools: MCPTool[] = [
       properties: {
         agentType: { type: 'string', description: 'Type of agent to spawn' },
         agentId: { type: 'string', description: 'Optional custom agent ID' },
+        id: { type: 'string', description: 'CLI name alias for agentId when enabled' },
         // #2085 — accept swarmId so spawned agents register in the
         // swarm.agents array that swarm_status reports. Omit to register
         // with the most-recently-created swarm.
@@ -302,9 +319,10 @@ export const agentTools: MCPTool[] = [
         domain: { type: 'string', description: 'Agent domain' },
         model: {
           type: 'string',
-          enum: ['haiku', 'sonnet', 'opus', 'opus-4.7', 'inherit'],
-          description: 'Claude model alias (haiku=fast/cheap, sonnet=balanced, opus=current Opus 4.8, opus-4.7=prior Opus pin)'
+          description: 'Legacy alias or native model identifier; a manual exact selection overrides family policy'
         },
+        modelTarget: { type: 'object', description: 'Optional family/provider/runtime/model/reasoningEffort override' },
+        work: { type: 'object', description: 'Task IDs, ownership, dependencies and deterministic parallel-benefit evidence for the Governor' },
         task: { type: 'string', description: 'Task description for intelligent model routing' },
         memoryBase: { type: 'string', description: 'Opt-in: base .rvf memory file to fork a per-agent Copy-On-Write branch from (agenticow). When set, the agent gets an isolated ~162-byte COW branch instead of a full copy — promote on success, discard on terminate. Requires the optional `agenticow` dep; degrades to a no-op when absent or when CLAUDE_FLOW_NO_COW_MEMORY=1.' },
         memoryDimension: { type: 'integer', description: 'Vector dimension for the COW base (required only when memoryBase does not exist yet)' },
@@ -319,7 +337,12 @@ export const agentTools: MCPTool[] = [
       }
 
       const store = loadAgentStore();
-      const agentId = (input.agentId as string) || `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const enabled = getModelFeatures(getProjectCwd()).enabled || getGovernorConfig(getProjectCwd()).enabled;
+      if (enabled && input.id !== undefined) {
+        const id = validateIdentifier(input.id, 'id');
+        if (!id.valid) return { success: false, error: id.error };
+      }
+      const agentId = (input.agentId as string) || (enabled && typeof input.id === 'string' ? input.id : undefined) || `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const agentType = input.agentType as string;
       const config = (input.config as Record<string, unknown>) || {};
 
@@ -330,6 +353,21 @@ export const agentTools: MCPTool[] = [
 
       // Get task from either top-level or config (CLI passes it in config.task)
       const task = (input.task as string) || (config.task as string) || undefined;
+      const cwd = getProjectCwd();
+      const features = getModelFeatures(cwd);
+      const governor = getGovernorConfig(cwd);
+      let override: ExecutableAgentRecord['modelOverride'];
+      let work: ExecutableAgentRecord['work'];
+      try {
+        if (features.enabled) {
+          override = ModelTargetSchema.parse({
+            ...(typeof config.model === 'string' ? { model: config.model } : {}),
+            ...(typeof config.provider === 'string' && config.providerExplicit !== false ? { provider: config.provider } : {}),
+            ...(config.modelTarget as Record<string, unknown> ?? {}), ...(input.modelTarget as Record<string, unknown> ?? {}),
+          });
+        }
+        if (features.enabled || governor.enabled) work = normalizeWork(input.work ?? config.work, task);
+      } catch (error) { return { success: false, error: `Invalid execution configuration: ${error instanceof Error ? error.message : String(error)}` }; }
 
       // Determine model using ADR-026 3-tier routing logic
       const routingResult = await determineAgentModel(
@@ -365,10 +403,45 @@ export const agentTools: MCPTool[] = [
           ? { provider: explicitConfigProvider }
           : routingResult.provider ? { provider: routingResult.provider } : {}),
         ...(routingResult.openrouterModel ? { openrouterModel: routingResult.openrouterModel } : {}),
+        ...(features.enabled ? { modelOverride: override,
+          modelTarget: { ...features.defaults[resolveRoleFamily(agentType, features, override)],
+            ...override, family: resolveRoleFamily(agentType, features, override), selectedBy: override?.model ? 'manual' : 'policy' },
+        } : {}),
+        ...(work ? { work } : {}),
       };
 
-      store.agents[agentId] = agent;
-      saveAgentStore(store);
+      if (features.enabled || governor.enabled) {
+        const admission = await withAgentRegistryLock(cwd, async () => {
+          const fresh = loadAgentStore();
+          if (fresh.agents[agentId]) return { success: false, error: 'Agent ID already registered' };
+          if (governor.enabled) {
+            const { loadSwarmStore } = await import('./swarm-tools.js');
+            const swarms = loadSwarmStore().swarms;
+            const swarm = input.swarmId ? swarms[String(input.swarmId)]
+              : Object.values(swarms).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+            const root = new ConfigFileManager().load(cwd);
+            const maxAgents = Math.min(configuredAgentLimit((root?.swarm as Record<string, unknown> | undefined)?.maxAgents),
+              configuredAgentLimit((root?.agents as Record<string, unknown> | undefined)?.maxConcurrent), swarm ? configuredAgentLimit(swarm.maxAgents) : Infinity);
+            const authority = getExecutionPolicyContext(cwd);
+            const plannedPath = agent.modelTarget?.runtime === 'api' ? cwd : resolve(cwd, String(agent.config.worktreePath ?? '.'));
+            const resource = existsSync(plannedPath) ? realpathSync(plannedPath) : plannedPath;
+            const decision = decideAgentSpawn({ config: governor, work: work!, role: agentType,
+              agents: Object.values(loadAllAgents()), maxAgents,
+              budget: readAgentBudgets(authority.projectRoot, agentId, resource, [authority.callerId]) });
+            agent.recommendation = decision;
+            recordExecutionEvent(cwd, { event: decision.allowed ? 'spawn' : 'spawn_denied', agentId, role: agentType,
+              target: agent.modelTarget, taskId: work?.taskId, parentTaskId: work?.parentTaskId,
+              spawnReason: decision.spawnReason, recommendedAgents: decision.recommendedAgents,
+              actualAgents: decision.activeAgents + (decision.allowed ? 1 : 0), recommendation: decision,
+              ...(decision.allowed ? {} : { failure: decision.reason }) });
+            if (!decision.allowed) return { success: false, error: `Agent Governor denied spawn: ${decision.reason}`,
+              recommendation: decision, ...(decision.duplicateAgentId ? { duplicateAgentId: decision.duplicateAgentId } : {}) };
+          }
+          fresh.agents[agentId] = agent; saveAgentStore(fresh);
+          return { success: true };
+        });
+        if (!admission.success) return admission;
+      } else { store.agents[agentId] = agent; saveAgentStore(store); }
 
       // #2085 — also push to the swarm store's agents array so that
       // swarm_status reports the new agent. Without this, agent_spawn
@@ -422,8 +495,15 @@ export const agentTools: MCPTool[] = [
             memoryBranch = br.branchPath;
             agent.memoryBranch = br.branchPath;
             agent.memoryBase = br.basePath;
-            store.agents[agentId] = agent;
-            saveAgentStore(store);
+            if (features.enabled || governor.enabled) await withAgentRegistryLock(cwd, () => {
+              const fresh = loadAgentStore();
+              if (fresh.agents[agentId]) {
+                fresh.agents[agentId].memoryBranch = br.branchPath;
+                fresh.agents[agentId].memoryBase = br.basePath;
+                saveAgentStore(fresh);
+              }
+            });
+            else { store.agents[agentId] = agent; saveAgentStore(store); }
           }
           // else: degraded (agenticow missing / kill-switched) — agent stands
           // without an isolated branch; callers see no memoryBranch field.
@@ -443,6 +523,8 @@ export const agentTools: MCPTool[] = [
         // persisted (previously this always reported the router's own
         // pick, silently dropping an explicit config.provider override).
         ...(agent.provider ? { provider: agent.provider } : {}),
+        ...(agent.modelTarget ? { modelTarget: agent.modelTarget } : {}),
+        ...(agent.recommendation ? { recommendation: agent.recommendation } : {}),
         ...(routingResult.openrouterModel ? { openrouterModel: routingResult.openrouterModel } : {}),
         status: 'registered',
         createdAt: agent.createdAt,
@@ -476,7 +558,7 @@ export const agentTools: MCPTool[] = [
     // updating the agent record with lastResult / taskCount / status.
     // No mock — actual HTTP request to api.anthropic.com.
     name: 'agent_execute',
-    description: 'Run a task on a previously-spawned agent_spawn record via the Anthropic Messages API with that agent\'s configured model. Use when native Task tool is wrong because (a) you need the spawned agent\'s persistent config (model, instructions, cost-tracking attribution) to apply to this turn, (b) the result needs to feed back into the agent\'s lifecycle (taskCount, lastResult, swarm-coordinated state), or (c) you want explicit model routing via the spawn record\'s `model` field instead of inheriting. For one-shot Claude prompts without a tracked agent, native Task is fine. Requires ANTHROPIC_API_KEY in env.',
+    description: 'Run a task using a persistent agent configuration. The default path retains existing API routing. With heterogeneousModels enabled, family policy and the configured selector choose an API, Claude Code or Codex target; Governor and existing policy budgets enforce admission. Results update lifecycle, usage and model telemetry. API runtimes require configured provider credentials; native runtimes use their existing authentication.',
     category: 'agent',
     inputSchema: {
       type: 'object',
@@ -486,6 +568,7 @@ export const agentTools: MCPTool[] = [
         systemPrompt: { type: 'string', description: 'Optional system prompt (overrides agent default)' },
         maxTokens: { type: 'number', description: 'Max output tokens (default 1024)' },
         temperature: { type: 'number', description: 'Sampling temperature 0..1 (default 0.7)' },
+        timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds' },
       },
       required: ['agentId', 'prompt'],
     },
@@ -722,6 +805,27 @@ export const agentTools: MCPTool[] = [
       }
 
       if (action === 'scale') {
+        if (getGovernorConfig(getProjectCwd()).enabled || getModelFeatures(getProjectCwd()).enabled) {
+          const targetSize = Math.max(0, Math.floor(Number(input.targetSize ?? 1)));
+          if (!Number.isFinite(targetSize) || targetSize > 50) return { success: false, error: 'Invalid targetSize' };
+          const agentType = String(input.agentType ?? 'worker');
+          const matching = agents.filter(a => a.agentType === agentType);
+          const added: string[] = []; const denied: unknown[] = [];
+          for (let i = matching.length; i < targetSize; i++) {
+            const result = await agentTools.find(t => t.name === 'agent_spawn')!.handler({ agentType }) as Record<string, unknown>;
+            if (result.success === false) { denied.push(result); break; }
+            added.push(String(result.agentId));
+          }
+          if (targetSize < matching.length) {
+            await withAgentRegistryLock(getProjectCwd(), () => {
+              const fresh = loadAgentStore();
+              for (const a of matching.filter(a => a.status === 'idle').slice(0, matching.length - targetSize)) fresh.agents[a.agentId].status = 'terminated';
+              saveAgentStore(fresh);
+            });
+          }
+          return { success: denied.length === 0, action, added, denied,
+            newSize: Object.values(loadAgentStore().agents).filter(a => a.agentType === agentType && a.status !== 'terminated').length };
+        }
         const targetSize = (input.targetSize as number) || 5;
         const agentType = (input.agentType as string) || 'worker';
         const currentSize = agents.filter(a => a.agentType === agentType).length;
@@ -892,11 +996,22 @@ export const agentTools: MCPTool[] = [
       const agent = store.agents[agentId];
 
       if (agent) {
+        if (agent.executionId && input.config) return { success: false, error: 'Cannot change configuration while agent is executing' };
         if (input.status) agent.status = input.status as AgentRecord['status'];
         if (typeof input.health === 'number') agent.health = input.health as number;
         if (typeof input.taskCount === 'number') agent.taskCount = input.taskCount as number;
         if (input.config) {
           agent.config = { ...agent.config, ...(input.config as Record<string, unknown>) };
+          if (getModelFeatures(getProjectCwd()).enabled) {
+            const updates = input.config as Record<string, unknown>;
+            try {
+              agent.modelOverride = ModelTargetSchema.parse({ ...agent.modelOverride,
+                ...(typeof updates.model === 'string' ? { model: updates.model } : {}),
+                ...(typeof updates.provider === 'string' ? { provider: updates.provider } : {}),
+                ...(updates.modelTarget as Record<string, unknown> ?? {}),
+              });
+            } catch { return { success: false, error: 'Invalid model target update' }; }
+          }
         }
         saveAgentStore(store);
 
@@ -970,3 +1085,17 @@ export const agentTools: MCPTool[] = [
     },
   },
 ];
+
+// All enabled lifecycle mutations share the same ownership lock as admission/execution.
+for (const tool of agentTools) {
+  if (!['agent_update', 'agent_terminate', 'agent_pool'].includes(tool.name)) continue;
+  const handler = tool.handler;
+  tool.handler = async (input) => {
+    const cwd = getProjectCwd();
+    const needsLock = tool.name !== 'agent_pool' || input.action === 'drain';
+    if (needsLock && (getGovernorConfig(cwd).enabled || getModelFeatures(cwd).enabled)) {
+      return withAgentRegistryLock(cwd, () => handler(input));
+    }
+    return handler(input);
+  };
+}

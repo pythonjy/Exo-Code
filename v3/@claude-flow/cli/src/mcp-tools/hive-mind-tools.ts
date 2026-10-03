@@ -275,6 +275,9 @@ export const hiveMindTools: MCPTool[] = [
         role: { type: 'string', enum: ['worker', 'specialist', 'scout'], description: 'Worker role in hive', default: 'worker' },
         agentType: { type: 'string', description: 'Agent type for spawned workers', default: 'worker' },
         prefix: { type: 'string', description: 'Prefix for worker IDs', default: 'hive-worker' },
+        task: { type: 'string', description: 'Worker task description' },
+        config: { type: 'object', description: 'Agent configuration including optional modelTarget' },
+        work: { type: 'object', description: 'Governor work metadata, assignments and parallel benefit' },
       },
     },
     handler: async (input) => {
@@ -294,6 +297,26 @@ export const hiveMindTools: MCPTool[] = [
       const agentStore = loadAgentStore();
 
       const spawnedWorkers: Array<{ agentId: string; role: string; joinedAt: string }> = [];
+
+      const { getGovernorConfig } = await import('../services/agent-governor.js');
+      const { getModelFeatures } = await import('../services/model-selection.js');
+      if (getGovernorConfig(getProjectCwd()).enabled || getModelFeatures(getProjectCwd()).enabled) {
+        const { agentTools } = await import('./agent-tools.js');
+        const spawn = agentTools.find(t => t.name === 'agent_spawn')!;
+        let denial: unknown;
+        for (let i = 0; i < count; i++) {
+          const agentId = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+          const result = await spawn.handler({ agentType, agentId, domain: 'hive-mind',
+            config: { role, hiveRole: role, ...(input.config as Record<string, unknown> ?? {}) },
+            ...(input.work ? { work: input.work } : {}), ...(input.task ? { task: input.task } : {}),
+          }) as Record<string, unknown>;
+          if (result.success === false) { denial = result; break; }
+          state.workers.push(agentId); spawnedWorkers.push({ agentId, role, joinedAt: new Date().toISOString() });
+        }
+        saveHiveState(state);
+        return { success: denial === undefined, spawned: spawnedWorkers.length, workers: spawnedWorkers,
+          totalWorkers: state.workers.length, ...(denial ? { denial } : {}) };
+      }
 
       for (let i = 0; i < count; i++) {
         const agentId = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -1012,7 +1035,14 @@ export const hiveMindTools: MCPTool[] = [
         };
       }
 
-      // Clear workers from agent store
+      const { getModelFeatures } = await import('../services/model-selection.js');
+      const { getGovernorConfig } = await import('../services/agent-governor.js');
+      if (getModelFeatures(getProjectCwd()).enabled || getGovernorConfig(getProjectCwd()).enabled) {
+        const { agentTools } = await import('./agent-tools.js');
+        const terminate = agentTools.find(t => t.name === 'agent_terminate')!;
+        for (const agentId of state.workers) await terminate.handler({ agentId });
+      }
+      // Retain cleanup of legacy workers when upgrading an existing hive.
       const agentStore = loadAgentStore();
       for (const workerId of state.workers) {
         if (agentStore.agents[workerId]) {

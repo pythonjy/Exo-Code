@@ -5,6 +5,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { validateModelFeatures } from './model-contract.js';
 
 /** Config file search paths in priority order */
 const CONFIG_FILENAMES = [
@@ -90,6 +91,7 @@ export class ConfigFileManager {
       if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
         throw new Error('Config file must contain a JSON object');
       }
+      validateModelFeatures(parsed as Record<string, unknown>);
       this.config = parsed as Record<string, unknown>;
       return this.config;
     } catch (error) {
@@ -127,12 +129,13 @@ export class ConfigFileManager {
     }
     // A targeted update must not persist unrelated defaults (notably the
     // default memory path, which would relocate an existing memory store).
-    const config = this.config ?? this.load(cwd) ?? {};
+    const config = structuredClone(this.config ?? this.load(cwd) ?? {});
     if (Object.hasOwn(config, key)) {
       config[key] = value;
     } else {
       setNestedValue(config, key, value);
     }
+    validateModelFeatures(config);
     this.config = config;
     const targetPath = this.configPath ?? path.resolve(cwd, CONFIG_FILENAMES[0]);
     this.writeAtomic(targetPath, config);
@@ -146,6 +149,7 @@ export class ConfigFileManager {
       throw new Error(`Config file already exists: ${targetPath}. Use --force to overwrite.`);
     }
     const config = { ...DEFAULT_CONFIG, ...overrides };
+    validateModelFeatures(config);
     this.writeAtomic(targetPath, config);
     this.config = config;
     this.configPath = targetPath;
@@ -184,6 +188,7 @@ export class ConfigFileManager {
     if (typeof imported !== 'object' || imported === null || Array.isArray(imported)) {
       throw new Error('Import file must contain a JSON object');
     }
+    validateModelFeatures(imported);
     const targetPath = this.configPath ?? path.resolve(cwd, CONFIG_FILENAMES[0]);
     this.writeAtomic(targetPath, imported);
     this.config = imported;

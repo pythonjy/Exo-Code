@@ -420,8 +420,31 @@ function verifyPolicyEvidence(evidence: PolicyEvidence): boolean {
 export async function evaluatePolicyRequest(
   request: PolicyRequest,
   projectRoot = process.cwd(),
+  spendingPrincipals: readonly string[] = [],
 ): Promise<PolicyDecision> {
-  return withPolicyTransaction(projectRoot, (engine) => engine.evaluate(request));
+  return withPolicyTransaction(projectRoot, (engine) => engine.evaluate(request, spendingPrincipals));
+}
+
+/** Host-only settlement; no MCP mutation tool exposes this authority. */
+export async function settlePolicyUsage(receiptId: string, usage: { costUsd?: number; tokens?: number }, projectRoot: string): Promise<void> {
+  return withPolicyTransaction(projectRoot, engine => engine.settleUsage(receiptId, usage));
+}
+
+/** Preserve verified caller scope and the common policy root for native execution adapters. */
+export function getExecutionPolicyContext(projectRoot: string): { projectRoot: string; envelope?: CapabilityEnvelope; callerId: string } {
+  const callerId = resolveMcpCallerIdentity().id;
+  if (!process.env.CLAUDE_FLOW_CAPABILITY_ENVELOPE) return { projectRoot, callerId };
+  let envelope: CapabilityEnvelope;
+  try {
+    const parsed: unknown = JSON.parse(process.env.CLAUDE_FLOW_CAPABILITY_ENVELOPE);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not object');
+    envelope = parsed as CapabilityEnvelope;
+  } catch { throw new Error('invalid-worker-capability-envelope'); }
+  try {
+    const common = execFileSync('git', ['-C', realpathSync(projectRoot), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return { projectRoot: dirname(realpathSync(common)), envelope, callerId };
+  } catch { throw new Error('authoritative-worker-policy-root-unavailable'); }
 }
 
 export async function setPolicyMode(mode: PolicyState['mode'], projectRoot = process.cwd()): Promise<void> {

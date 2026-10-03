@@ -28,6 +28,9 @@ export function swarmView(ctx: Ctx): RenderElement {
   }
 
   rows.push(kv(ctx, 'topology', swarm === null ? `${hive?.topology ?? 'n/a'} (hive-mind)` : `${swarm.topology}${swarm.strategy !== undefined ? ` · ${swarm.strategy}` : ''} · ${swarm.status}${swarm.maxAgents !== undefined ? ` · max ${swarm.maxAgents}` : ''}`))
+  const governed = agents.filter(a => a.recommendedAgents !== undefined)
+  const recent = governed.at(-1)
+  if (recent !== undefined) rows.push(kv(ctx, 'agent governor', `recommended ${recent.recommendedAgents} · registered ${agents.filter(a => a.status !== 'terminated').length} · busy ${agents.filter(a => a.status === 'busy').length} · effective limit ${recent.hardLimit ?? 'unknown'}`))
   rows.push(picture(ctx, 'topology', `graph needs a terminal: ${agents.length} agents`))
   rows.push(text(ctx, '★ leader · ◉ busy (a dot runs to it while it works) · ● idle · grey stopped · a white flash = an event about that agent', { dimColor: true }))
   rows.push(rule(ctx, 'Agents', `${agents.length} · j/k pick · d open · x actions`))

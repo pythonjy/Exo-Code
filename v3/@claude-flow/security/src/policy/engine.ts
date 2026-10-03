@@ -133,24 +133,56 @@ export class AgenticPolicyEngine {
     return true;
   }
 
-  evaluate(request: PolicyRequest): PolicyDecision {
+  /** Additional spending principals are supplied by a trusted host, never request metadata. */
+  evaluate(request: PolicyRequest, spendingPrincipals: readonly string[] = []): PolicyDecision {
+    const metadata = { ...request.context?.metadata };
+    delete metadata.settlementFor;
+    delete metadata.spendingPrincipals;
+    if (spendingPrincipals.length) metadata.spendingPrincipals = [...new Set(spendingPrincipals)];
     const normalized: PolicyRequest = {
       ...request,
       requestId: request.requestId ?? crypto.randomUUID(),
       // Caller time is evidence only; expiry, budgets, and receipts always use
       // the authority's clock.
-      context: { ...request.context, now: this.now() },
+      context: { ...request.context, ...(request.context?.metadata || spendingPrincipals.length ? { metadata } : {}), now: this.now() },
     };
     this.validateRequest(normalized);
     const verifiedEvidenceIds = (normalized.context?.evidence ?? [])
       .filter((evidence) => evidence.id && this.evidenceVerifier?.(evidence, normalized) === true)
       .map((evidence) => evidence.id!);
     let decision = evaluatePolicy(normalized, this.state.rules, this.state.mode, verifiedEvidenceIds);
-    decision = this.applyBudget(normalized, decision);
+    decision = this.applyBudget(normalized, decision, spendingPrincipals);
     decision = this.applyApproval(normalized, decision);
     const receipt = this.appendReceipt(normalized, decision);
-    this.consumeBudget(normalized, decision);
+    this.consumeBudget(normalized, decision, spendingPrincipals);
     return { ...decision, receiptId: receipt.payload.receiptId };
+  }
+
+  /** Trusted metering settlement for an already-authorized operation, never authorization for new work.
+   * Conservative: reservations are not refunded; any observed overrun is charged even past the ceiling.
+   */
+  settleUsage(receiptId: string, actual: { costUsd?: number; tokens?: number }): void {
+    for (const value of [actual.costUsd, actual.tokens]) {
+      if (value !== undefined && (!Number.isFinite(value) || value < 0)) throw new Error('invalid-settlement-usage');
+    }
+    if (!this.verifyLedger().valid) throw new Error('invalid-settlement-ledger');
+    const original = this.state.receipts.find(r => r.payload.receiptId === receiptId)?.payload;
+    if (!original || original.decision.enforcedOutcome !== 'allowed') throw new Error('settlement-requires-authorized-receipt');
+    if (original.decision.reason === 'authorized-operation-usage-settled') throw new Error('cannot-settle-a-settlement');
+    if (this.state.receipts.some(r => r.payload.decision.reason === 'authorized-operation-usage-settled' &&
+      r.payload.request.context?.metadata?.settlementFor === receiptId)) throw new Error('usage-already-settled');
+    const principals = original.request.context?.metadata?.spendingPrincipals;
+    const spendingPrincipals = Array.isArray(principals) ? principals.filter((id): id is string => typeof id === 'string') : [];
+    const deltaCost = actual.costUsd === undefined ? undefined : Math.max(0, actual.costUsd - (original.request.action.costUsd ?? 0));
+    const deltaTokens = actual.tokens === undefined ? undefined : Math.max(0, actual.tokens - (original.request.action.tokens ?? 0));
+    const request: PolicyRequest = { ...original.request, requestId: crypto.randomUUID(),
+      action: { ...original.request.action, costUsd: deltaCost, tokens: deltaTokens },
+      context: { now: this.now(), metadata: { settlementFor: receiptId, spendingPrincipals, actualCostUsd: actual.costUsd, actualTokens: actual.tokens } },
+    };
+    const decision: Omit<PolicyDecision, 'receiptId'> = { requestId: request.requestId!, mode: this.state.mode,
+      outcome: 'allowed', enforcedOutcome: 'allowed', reason: 'authorized-operation-usage-settled', matchedRules: original.decision.matchedRules, obligations: [] };
+    this.appendReceipt(request, decision);
+    this.consumeBudget(request, decision, spendingPrincipals);
   }
 
   verifyLedger(): LedgerVerification {
@@ -198,11 +230,11 @@ export class AgenticPolicyEngine {
     return { valid: true, length, anchor: 'established-now' };
   }
 
-  private applyBudget(request: PolicyRequest, decision: Omit<PolicyDecision, 'receiptId'>): Omit<PolicyDecision, 'receiptId'> {
+  private applyBudget(request: PolicyRequest, decision: Omit<PolicyDecision, 'receiptId'>, spendingPrincipals: readonly string[] = []): Omit<PolicyDecision, 'receiptId'> {
     if (decision.outcome === 'denied') return decision;
     const now = request.context?.now ?? this.now();
     for (const limit of this.state.budgets) {
-      if (!wildcard(limit.principal, request.identity.id)
+      if (![request.identity.id, ...spendingPrincipals].some(id => wildcard(limit.principal, id))
         || !wildcard(limit.action, request.action.type)
         || !wildcard(limit.resource, request.action.resource)) continue;
       let usage = this.state.usage.find((item) => item.limitId === limit.id);
@@ -250,11 +282,11 @@ export class AgenticPolicyEngine {
     };
   }
 
-  private consumeBudget(request: PolicyRequest, decision: Omit<PolicyDecision, 'receiptId'>): void {
+  private consumeBudget(request: PolicyRequest, decision: Omit<PolicyDecision, 'receiptId'>, spendingPrincipals: readonly string[] = []): void {
     if (decision.enforcedOutcome !== 'allowed') return;
     const now = request.context?.now ?? this.now();
     for (const limit of this.state.budgets) {
-      if (!wildcard(limit.principal, request.identity.id)
+      if (![request.identity.id, ...spendingPrincipals].some(id => wildcard(limit.principal, id))
         || !wildcard(limit.action, request.action.type)
         || !wildcard(limit.resource, request.action.resource)) continue;
       let usage = this.state.usage.find((item) => item.limitId === limit.id);

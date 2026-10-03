@@ -4,8 +4,8 @@ import { ago, button, col, kv, row, rule, text, THEME, type Ctx } from './common
 
 /**
  * One agent, drilled into: its role and state from the agent store, the tasks assigned to it and the claims it holds,
- * the status changes and events the console saw, and the tail of `ruflo agent logs`. Cost per ruflo agent is not
- * recorded anywhere, so it reads n/a; Claude Code's own spend is on the Cost view.
+ * the status changes and events the console saw, and the tail of `ruflo agent logs`. Opt-in heterogeneous
+ * runs add model target and reported per-agent usage; legacy agents retain the previous unavailable state.
  */
 export function agentView(ctx: Ctx): RenderElement {
   const { state, nowMs } = ctx
@@ -30,7 +30,13 @@ export function agentView(ctx: Ctx): RenderElement {
   rows.push(kv(ctx, 'created', agent.createdAtMs === undefined ? 'n/a' : ago(agent.createdAtMs, nowMs)))
   rows.push(kv(ctx, 'current task', tasks.length === 0 ? 'none assigned in tasks/store.json' : tasks.map(task => `${task.id} (${task.status}) ${task.description}`).join(' · ')))
   rows.push(kv(ctx, 'claims', claims.length === 0 ? 'none' : claims.map(claim => `${claim.issueId} ${claim.status}${claim.handoffTo === agent.id ? ' (handoff to it)' : ''}`).join(' · ')))
-  rows.push(kv(ctx, 'tokens / cost', "n/a — ruflo records no per-agent usage; Claude Code's spend is on Cost (9)"))
+  if (agent.family !== undefined || agent.runtime !== undefined) {
+    rows.push(kv(ctx, 'model target', `${agent.family ?? 'unknown'} · ${agent.provider ?? 'unknown'} · ${agent.model ?? 'dynamic'} · ${agent.runtime ?? 'unknown'}`))
+    rows.push(kv(ctx, 'selector / spawn', `${agent.selector ?? 'unknown'} · ${agent.spawnReason ?? 'unknown'}`))
+    rows.push(kv(ctx, 'last execution', `input ${agent.inputTokens ?? 'unknown'} · output ${agent.outputTokens ?? 'unknown'} · cached ${agent.cachedTokens ?? 'unknown'} · USD ${agent.costUsd ?? 'unknown'} · ${agent.latencyMs ?? 'unknown'} ms`))
+    rows.push(kv(ctx, 'governor', `recommended ${agent.recommendedAgents ?? 'unknown'} · effective limit ${agent.hardLimit ?? 'unknown'}`))
+    if (agent.failure !== undefined) rows.push(kv(ctx, 'recent failure', agent.failure, THEME.bad))
+  } else rows.push(kv(ctx, 'tokens / cost', "n/a — ruflo records no per-agent usage; Claude Code's spend is on Cost (9)"))
 
   rows.push(rule(ctx, 'Timeline', 'status changes seen since the console loaded'))
   rows.push(text(ctx, log.length === 0 ? 'no change seen yet' : log.slice(-6).map(entry => `${ago(entry.atMs, nowMs)} ${entry.status}`).join('  →  '), { dimColor: log.length === 0 }))

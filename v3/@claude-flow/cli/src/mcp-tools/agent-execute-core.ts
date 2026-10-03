@@ -2,16 +2,20 @@
  * Shared agent-execution core.
  *
  * Both the agent_execute MCP tool and the workflow runtime (G3) need
- * to dispatch a prompt to an agent's configured Anthropic model. This
- * module factors that path out so it's testable and reusable, and
- * keeps the wire from agent_spawn → ProviderManager (real) in one
- * place rather than duplicated.
+ * to dispatch a prompt to an agent's configured provider/runtime. Opt-in
+ * heterogeneous execution wraps this existing API path and the native
+ * dual-mode worker lifecycle without replacing legacy alias routing.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getProjectCwd } from './types.js';
 import { configManager } from '../services/config-file-manager.js';
+import type { ModelTarget, AgentWork } from '../services/model-contract.js';
+import type { GovernorDecision } from '../services/agent-governor.js';
+import type { RuntimeUsage } from '../services/execution-telemetry.js';
+import { getModelFeatures } from '../services/model-selection.js';
+import { getGovernorConfig } from '../services/agent-governor.js';
 
 const STORAGE_DIR = '.claude-flow';
 const AGENT_DIR = 'agents';
@@ -39,7 +43,17 @@ export interface AgentRecord {
    */
   modelId?: string;
   /** ADR-148 phase 2 — execution provider hint. #2962 widened to include 'ollama'. */
-  provider?: 'anthropic' | 'openrouter' | 'ollama';
+  provider?: string;
+  modelTarget?: ModelTarget;
+  modelOverride?: ModelTarget;
+  policyFamily?: string;
+  selectionWarning?: string;
+  work?: AgentWork;
+  recommendation?: GovernorDecision;
+  lastExecutionAt?: string;
+  executionId?: string;
+  executionLease?: { cwd: string; nativeWriter: boolean; readOnly: boolean };
+  pendingSettlement?: { receiptId: string; policyRoot: string; costUsd?: number; tokens?: number };
   /** ADR-148 phase 2 — concrete OpenRouter slug when provider='openrouter'. */
   openrouterModel?: string;
   lastResult?: Record<string, unknown>;
@@ -108,7 +122,11 @@ export interface AnthropicCallInput {
    * inference callAnthropicMessages otherwise does — see the precedence
    * comment on that function.
    */
-  provider?: 'anthropic' | 'openrouter' | 'ollama';
+  provider?: string;
+  /** Only new opt-in targets require exact provider dispatch. */
+  strictProvider?: boolean;
+  collectUsage?: boolean;
+  reasoningEffort?: string;
 }
 
 /** A single entry from the persisted `agents.providers` config array. */
@@ -153,6 +171,9 @@ export interface AnthropicCallResult {
   usage?: { inputTokens: number; outputTokens: number; totalTokens: number };
   durationMs?: number;
   error?: string;
+  metering?: RuntimeUsage;
+  costUsd?: number;
+  toolCalls?: number;
 }
 
 /**
@@ -174,6 +195,18 @@ export async function callAnthropicMessages(input: AnthropicCallInput): Promise<
   // `agents.providers` config (`providers configure`) → the original
   // key-presence inference, kept below as the last-resort fallback.
   const explicitProvider = (input.provider || process.env.RUFLO_PROVIDER || '').toLowerCase();
+  if (explicitProvider === 'openai') {
+    const persisted = getPersistedProviderConfig('openai');
+    const apiKey = process.env.OPENAI_API_KEY || persisted?.apiKey;
+    if (!apiKey) return { success: false, error: 'OpenAI provider credential unavailable' };
+    if (!input.model && !persisted?.model && !process.env.OPENAI_MODEL) return { success: false, error: 'OpenAI native model must be configured' };
+    return callOpenAICompat({ ...input, apiKey,
+      baseUrl: (process.env.OPENAI_BASE_URL || persisted?.baseUrl || 'https://api.openai.com').replace(/\/v1\/?$/, ''),
+      providerLabel: 'openai', defaultModel: input.model || persisted?.model || process.env.OPENAI_MODEL! });
+  }
+  if (input.strictProvider && !['anthropic', 'openrouter', 'ollama'].includes(explicitProvider)) {
+    return { success: false, error: `Unsupported execution provider: ${explicitProvider}` };
+  }
   const ollamaKey = process.env.OLLAMA_API_KEY;
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
   // #2042 — OpenRouter is an OpenAI-compat endpoint that fronts dozens of
@@ -184,7 +217,7 @@ export async function callAnthropicMessages(input: AnthropicCallInput): Promise<
   // branch above).
   const openrouterKey = process.env.OPENROUTER_API_KEY;
   const useOpenRouter =
-    explicitProvider === 'openrouter' || (!anthropicKey && !!openrouterKey);
+    explicitProvider === 'openrouter' || (!input.strictProvider && !anthropicKey && !!openrouterKey);
   // #2962 — only consult the persisted config when a candidate is actually
   // relevant (explicit choice, or no env key found anywhere), so a normal
   // ANTHROPIC_API_KEY-only setup never pays a config-file read.
@@ -195,7 +228,7 @@ export async function callAnthropicMessages(input: AnthropicCallInput): Promise<
   const persistedOpenRouter =
     explicitProvider === 'openrouter' && !openrouterKey ? getPersistedProviderConfig('openrouter') : undefined;
   const useOllama =
-    explicitProvider === 'ollama' || (!anthropicKey && !openrouterKey && (!!ollamaKey || !!persistedOllama));
+    explicitProvider === 'ollama' || (!input.strictProvider && !anthropicKey && !openrouterKey && (!!ollamaKey || !!persistedOllama));
 
   if (useOpenRouter) {
     const apiKey = openrouterKey || persistedOpenRouter?.apiKey;
@@ -231,6 +264,9 @@ export async function callAnthropicMessages(input: AnthropicCallInput): Promise<
       });
     }
   }
+  if (input.strictProvider && explicitProvider !== 'anthropic') {
+    return { success: false, error: `${explicitProvider} provider credential unavailable` };
+  }
   if (!anthropicKey) {
     return {
       success: false,
@@ -253,6 +289,7 @@ export async function callAnthropicMessages(input: AnthropicCallInput): Promise<
       body: JSON.stringify({
         model,
         max_tokens: input.maxTokens || 1024,
+        ...(input.reasoningEffort ? { output_config: { effort: input.reasoningEffort } } : {}),
         // #2357 — omit temperature for models that reject sampling params
         // (Fable 5 / Opus 4.8 / Opus 4.7 → 400 "Extra inputs are not
         // permitted"); keep the 0.7 default unchanged for models that still
@@ -281,7 +318,7 @@ export async function callAnthropicMessages(input: AnthropicCallInput): Promise<
       model: string;
       content: Array<{ type: string; text?: string }>;
       stop_reason: string;
-      usage: { input_tokens: number; output_tokens: number };
+      usage?: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
     };
     const textOut = data.content
       .filter(c => c.type === 'text' && typeof c.text === 'string')
@@ -293,11 +330,12 @@ export async function callAnthropicMessages(input: AnthropicCallInput): Promise<
       messageId: data.id,
       stopReason: data.stop_reason,
       output: textOut,
-      usage: {
-        inputTokens: data.usage.input_tokens,
-        outputTokens: data.usage.output_tokens,
-        totalTokens: data.usage.input_tokens + data.usage.output_tokens,
-      },
+      ...(!input.collectUsage ? { usage: {
+        inputTokens: data.usage!.input_tokens,
+        outputTokens: data.usage!.output_tokens,
+        totalTokens: data.usage!.input_tokens + data.usage!.output_tokens,
+      } } : { metering: data.usage ? { inputTokens: data.usage.input_tokens + (data.usage.cache_read_input_tokens ?? 0) + (data.usage.cache_creation_input_tokens ?? 0), outputTokens: data.usage.output_tokens,
+        cachedTokens: data.usage.cache_read_input_tokens, cacheCreationTokens: data.usage.cache_creation_input_tokens } : undefined }),
       durationMs: Date.now() - startedAt,
     };
   } catch (err) {
@@ -393,6 +431,7 @@ async function callOllamaCompat(
         outputTokens: usage.completion_tokens ?? 0,
         totalTokens: usage.total_tokens ?? 0,
       },
+      ...(input.collectUsage ? { metering: data.usage ? { inputTokens: data.usage.prompt_tokens, outputTokens: data.usage.completion_tokens } : undefined } : {}),
       durationMs: Date.now() - startedAt,
     };
   } catch (err) {
@@ -444,8 +483,9 @@ async function callOpenAICompat(
       },
       body: JSON.stringify({
         model,
-        max_tokens: input.maxTokens || 1024,
-        temperature: typeof input.temperature === 'number' ? input.temperature : 0.7,
+        ...(input.providerLabel === 'openai'
+          ? { max_completion_tokens: input.maxTokens || 1024, ...(input.reasoningEffort ? { reasoning_effort: input.reasoningEffort } : {}) }
+          : { max_tokens: input.maxTokens || 1024, temperature: typeof input.temperature === 'number' ? input.temperature : 0.7 }),
         messages,
       }),
       signal: controller.signal,
@@ -459,7 +499,8 @@ async function callOpenAICompat(
       id?: string;
       model?: string;
       choices: Array<{ message: { content: string }; finish_reason?: string }>;
-      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number;
+        prompt_tokens_details?: { cached_tokens?: number }; cost?: number };
     };
     const textOut = data.choices?.[0]?.message?.content ?? '';
     const usage = data.usage ?? {};
@@ -474,6 +515,9 @@ async function callOpenAICompat(
         outputTokens: usage.completion_tokens ?? 0,
         totalTokens: usage.total_tokens ?? 0,
       },
+      ...(input.collectUsage ? { metering: data.usage ? { inputTokens: data.usage.prompt_tokens, outputTokens: data.usage.completion_tokens,
+        cachedTokens: data.usage.prompt_tokens_details?.cached_tokens } : undefined,
+      costUsd: data.usage?.cost } : {}),
       durationMs: Date.now() - startedAt,
     };
   } catch (err) {
@@ -543,6 +587,11 @@ export interface AgentExecuteResult {
   durationMs?: number;
   error?: string;
   remediation?: string;
+  modelTarget?: ModelTarget;
+  metering?: RuntimeUsage;
+  costUsd?: number;
+  costKind?: 'actual' | 'estimated';
+  accountingPending?: boolean;
   /**
    * ADR-149 iter 7 — present when the request was retried after a 429/5xx
    * via `nextCostOptimalAlternative`. Each entry records a model that
@@ -557,6 +606,17 @@ export async function executeAgentTask(input: AgentExecuteInput): Promise<AgentE
   const agent = store.agents[input.agentId];
   if (!agent) return { success: false, agentId: input.agentId, error: 'Agent not found' };
   if (agent.status === 'terminated') return { success: false, agentId: input.agentId, error: 'Agent has been terminated' };
+  // Shared by MCP and workflow execution: no new path can bypass admission/accounting.
+  const features = getModelFeatures(getProjectCwd());
+  const governor = getGovernorConfig(getProjectCwd());
+  if (features.enabled || governor.enabled) {
+    const { executeGovernedAgent } = await import('../services/heterogeneous-execution.js');
+    return executeGovernedAgent({ input, agent, features, governor,
+      loadAgents: () => loadAgentStore().agents,
+      saveAgent: (record) => { const current = loadAgentStore(); current.agents[record.agentId] = record; saveAgentStore(current); },
+      callApi: callAnthropicMessages, resolveLegacyModel: resolveAnthropicModel,
+    });
+  }
 
   // ADR-149 iter 13 — first-call dispatch prefers `agent.modelId` (the
   // cost-optimal pick from the neural backend) over `MODEL_MAP[agent.model]`
@@ -791,4 +851,3 @@ export async function executeAgentTask(input: AgentExecuteInput): Promise<AgentE
     }),
   };
 }
-
